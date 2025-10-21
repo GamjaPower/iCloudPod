@@ -8,10 +8,11 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 from urllib.parse import quote, urlparse
 
 import requests
+from tqdm import tqdm
 
 CK_RESOLVE_URL = (
     "https://ckdatabasews.icloud.com/database/1/"
@@ -122,96 +123,6 @@ def create_session() -> requests.Session:
     return sess
 
 
-class ProgressReporter:
-    """Render multi-line progress updates for concurrent downloads."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._order: list[str] = []
-        self._statuses: Dict[str, str] = {}
-        self._rendered = False
-        self._rows = 0
-        self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def register(self, label: str, initial: str = "0 B/s") -> None:
-        with self._lock:
-            if label not in self._statuses:
-                self._order.append(label)
-            self._statuses[label] = initial
-
-    def update(self, label: str, status: str) -> None:
-        with self._lock:
-            if label not in self._statuses:
-                self._order.append(label)
-            self._statuses[label] = status
-
-    def start(self) -> None:
-        with self._lock:
-            if self._thread and self._thread.is_alive():
-                return
-            self._stop_event.clear()
-            self._thread = threading.Thread(
-                target=self._run, name="progress-reporter", daemon=True
-            )
-            self._thread.start()
-
-    def finalize(self) -> None:
-        self._stop_event.set()
-        thread: Optional[threading.Thread]
-        with self._lock:
-            thread = self._thread
-        if thread:
-            thread.join()
-        with self._lock:
-            self._thread = None
-            self._rendered = False
-            self._rows = 0
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._render(stay=True)
-            if self._stop_event.wait(1.0):
-                break
-        self._render(stay=False)
-
-    def _render(self, *, stay: bool) -> None:
-        with self._lock:
-            order_snapshot = list(self._order)
-            status_snapshot = {label: self._statuses[label] for label in order_snapshot}
-            rows = len(order_snapshot)
-            rendered_before = self._rendered
-            prev_rows = self._rows
-            self._rendered = self._rendered or bool(order_snapshot)
-            if rows > self._rows:
-                self._rows = rows
-        if not order_snapshot:
-            return
-        if not rendered_before:
-            sys.stdout.write("\n" * rows)
-            sys.stdout.write(f"\033[{rows}A")
-            sys.stdout.write("\033[s")
-        else:
-            sys.stdout.write("\033[u")
-            if rows > prev_rows:
-                sys.stdout.write(f"\033[{prev_rows}B")
-                sys.stdout.write("\n" * (rows - prev_rows))
-                sys.stdout.write(f"\033[{rows}A")
-            sys.stdout.write("\033[s")
-        for label in order_snapshot:
-            status = status_snapshot.get(label, "")
-            display = label or "-"
-            sys.stdout.write("\r\033[K")
-            sys.stdout.write(f"{display} {status}")
-            if label != order_snapshot[-1]:
-                sys.stdout.write("\033[B\r")
-        if stay:
-            sys.stdout.write("\033[B\r")
-        else:
-            sys.stdout.write("\033[B\r")
-            sys.stdout.write("\033[s")
-        sys.stdout.flush()
-
 def format_size(num_bytes: float) -> str:
     """Return a short human readable representation of a byte value."""
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -227,21 +138,87 @@ def download_file(
     total_size: Optional[int],
     session: Optional[requests.Session] = None,
     chunk_size: int = 1 << 20,
-    progress_callback: Optional[Callable[[int, Optional[int], str], None]] = None,
+    progress_bar: Optional[tqdm] = None,
 ) -> None:
     """Download a file sequentially."""
-    if total_size is None:
-        print("Unknown file size, using single stream download...")
-    else:
-        print(f"Total size: {total_size:,} bytes, chunk size: {chunk_size:,} bytes")
     _download_sequential(
         download_url,
         destination,
         total_size,
         session,
         chunk_size,
-        progress_callback=progress_callback,
+        progress_bar=progress_bar,
     )
+
+
+def _download_sequential(
+    download_url: str,
+    destination: Path,
+    total_size: Optional[int],
+    session: Optional[requests.Session],
+    chunk_size: int,
+    progress_bar: Optional[tqdm] = None,
+) -> None:
+    close_after = session is None
+    sess = session or create_session()
+    downloaded = 0
+    start_time = time.monotonic()
+    last_update = 0.0
+
+    with sess.get(download_url, stream=True) as response:
+        response.raise_for_status()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                output.write(chunk)
+                downloaded += len(chunk)
+                elapsed = max(time.monotonic() - start_time, 1e-6)
+
+                if progress_bar:
+                    progress_bar.update(len(chunk))
+                    now = time.monotonic()
+                    if now - last_update >= 0.2 or (
+                        total_size and downloaded >= total_size
+                    ):
+                        postfix = {"speed": format_size(downloaded / elapsed) + "/s"}
+                        if total_size:
+                            percent = downloaded * 100 / total_size
+                            postfix["percent"] = f"{percent:5.1f}%"
+                            postfix["total"] = format_size(total_size)
+                        progress_bar.set_postfix(postfix, refresh=False)
+                        last_update = now
+                else:
+                    speed = format_size(downloaded / elapsed) + "/s"
+                    if total_size:
+                        percent = downloaded * 100 / total_size
+                        status = (
+                            f"\rDownloading {destination.name}: "
+                            f"{downloaded:,}/{total_size:,} bytes ({percent:.1f}%) "
+                            f"@ {speed}"
+                        )
+                    else:
+                        status = (
+                            f"\rDownloading {destination.name}: {downloaded:,} bytes "
+                            f"@ {speed}"
+                        )
+                    sys.stdout.write(status)
+                    sys.stdout.flush()
+
+    if progress_bar:
+        elapsed_total = max(time.monotonic() - start_time, 1e-6)
+        postfix = {"speed": format_size(downloaded / elapsed_total) + "/s"}
+        if total_size:
+            percent = downloaded * 100 / total_size
+            postfix["percent"] = f"{percent:5.1f}%"
+            postfix["total"] = format_size(total_size)
+        progress_bar.set_postfix(postfix, refresh=True)
+    else:
+        sys.stdout.write("\n")
+
+    if close_after:
+        sess.close()
 
 
 def load_share_links(config_path: Path) -> list[str]:
@@ -265,136 +242,106 @@ def load_share_links(config_path: Path) -> list[str]:
     return urls
 
 
-def download_share(
-    share_url: str,
-    output_dir: str = ".",
-    reporter: Optional[ProgressReporter] = None,
-) -> Path:
-    """Download a single iCloud share link and return the destination path."""
-    label = share_url
-    short_guid = extract_short_guid(share_url)
-    with create_session() as session:
-        try:
+def prepare_downloads(share_urls: list[str]) -> list[Dict[str, Optional[str]]]:
+    """Resolve metadata for each share URL and return a sorted list."""
+    downloads: list[Dict[str, Optional[str]]] = []
+    for share_url in share_urls:
+        short_guid = extract_short_guid(share_url)
+        with create_session() as session:
             resolved = resolve_share(short_guid, session=session)
-            metadata = build_download_metadata(resolved, share_url)
-            filename = metadata["filename"]
-            label = filename
-            download_url = metadata["download_url"]
-            size = metadata["size"]
+        metadata = build_download_metadata(resolved, share_url)
+        downloads.append(metadata)
 
-            destination = Path(output_dir).expanduser().resolve() / "downloads" / filename
-            print(f"Downloading '{filename}' to {destination}")
-            if size:
-                print(f"Reported size: {size:,} bytes")
-            if reporter:
-                reporter.register(label)
+    downloads.sort(key=lambda item: item["filename"] or "")
+    return downloads
 
-                def on_progress(downloaded: int, total: Optional[int], speed: str) -> None:
-                    if total:
-                        percent = downloaded * 100 / total
-                        total_fmt = format_size(total)
-                        status = f"{speed} {percent:5.1f}% {total_fmt}"
-                    else:
-                        status = f"{speed}"
-                    reporter.update(label, status)
 
-                download_file(
-                    download_url,
-                    destination,
-                    size,
-                    session=session,
-                    progress_callback=on_progress,
-                )
-            else:
-                download_file(download_url, destination, size, session=session)
-            print(f"Download complete for '{filename}'.")
-            return destination
-        except Exception as exc:  # noqa: BLE001
-            if reporter:
-                reporter.register(label)
-                reporter.update(label, "Failed")
-            raise
+def download_share(
+    metadata: Dict[str, Optional[str]],
+    downloads_dir: Path,
+    position: int,
+    total_progress: tqdm,
+) -> Path:
+    """Download a single share using a tqdm progress bar."""
+    filename = metadata["filename"] or "downloaded_file"
+    download_url = metadata["download_url"]
+    raw_size = metadata["size"]
+
+    total_size: Optional[int]
+    if isinstance(raw_size, int):
+        total_size = raw_size
+    elif isinstance(raw_size, str):
+        try:
+            total_size = int(raw_size)
+        except ValueError:
+            total_size = None
+    else:
+        total_size = None
+
+    destination = downloads_dir / filename
+
+    bar = tqdm(
+        total=total_size,
+        desc=filename,
+        position=position,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        dynamic_ncols=True,
+        leave=True,
+    )
+    success = False
+    try:
+        if total_progress is not None:
+            total_progress.set_postfix(file=filename, refresh=False)
+        with create_session() as session:
+            download_file(
+                download_url,
+                destination,
+                total_size,
+                session=session,
+                progress_bar=bar,
+            )
+        success = True
+    finally:
+        bar.close()
+        if success:
+            tqdm.write(f"Completed {filename}")
+    return destination
 
 
 def download_multiple(share_urls: list[str], output_dir: str = ".") -> None:
-    """Download multiple iCloud share links concurrently."""
+    """Download multiple iCloud share links concurrently with progress bars."""
     if not share_urls:
         print("No share URLs provided.")
         return
 
-    print(f"Starting concurrent download for {len(share_urls)} share(s).")
-    reporter = ProgressReporter()
-    reporter.start()
-    try:
-        with ThreadPoolExecutor(max_workers=len(share_urls)) as executor:
-            futures = {
-                executor.submit(download_share, url, output_dir, reporter): url
-                for url in share_urls
-            }
-            for future in as_completed(futures):
-                url = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Failed to download '{url}': {exc}")
-    finally:
-        reporter.finalize()
+    downloads_dir = Path(output_dir).expanduser().resolve() / "downloads"
+    downloads_dir.mkdir(parents=True, exist_ok=True)
 
+    downloads = prepare_downloads(share_urls)
+    if not downloads:
+        print("No downloadable items found.")
+        return
 
-def _download_sequential(
-    download_url: str,
-    destination: Path,
-    total_size: Optional[int],
-    session: Optional[requests.Session],
-    chunk_size: int,
-    progress_callback: Optional[Callable[[int, Optional[int], str], None]] = None,
-) -> None:
-    close_after = session is None
-    sess = session or create_session()
-    downloaded = 0
-    start_time = time.monotonic()
-    last_update = 0.0
-    reported_position = -1
+    tqdm.write(f"Starting concurrent download for {len(downloads)} share(s).")
 
-    with sess.get(download_url, stream=True) as response:
-        response.raise_for_status()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as output:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    continue
-                output.write(chunk)
-                downloaded += len(chunk)
-                elapsed = max(time.monotonic() - start_time, 1e-6)
-                speed = format_size(downloaded / elapsed) + "/s"
-                now = time.monotonic()
-                if progress_callback and (now - last_update >= 0.2 or downloaded == total_size):
-                    progress_callback(downloaded, total_size, speed)
-                    last_update = now
-                    reported_position = downloaded
-                elif not progress_callback:
-                    if total_size:
-                        percent = downloaded * 100 / total_size
-                        status = (
-                            f"\rDownloading {destination.name}: "
-                            f"{downloaded:,}/{total_size:,} bytes ({percent:.1f}%) "
-                            f"@ {speed}"
-                        )
-                    else:
-                        status = (
-                            f"\rDownloading {destination.name}: {downloaded:,} bytes "
-                            f"@ {speed}"
-                        )
-                    sys.stdout.write(status)
-                    sys.stdout.flush()
-    if progress_callback and downloaded != reported_position:
-        elapsed_total = max(time.monotonic() - start_time, 1e-6)
-        final_speed = format_size(downloaded / elapsed_total) + "/s"
-        progress_callback(downloaded, total_size, final_speed)
-    else:
-        sys.stdout.write("\n")
-    if close_after:
-        sess.close()
+    lock = threading.Lock()
+
+    def run_download(metadata: Dict[str, Optional[str]], index: int) -> None:
+        download_share(metadata, downloads_dir, index, None)
+
+    with ThreadPoolExecutor(max_workers=len(downloads)) as executor:
+        future_map = {
+            executor.submit(run_download, metadata, index): metadata["filename"]
+            for index, metadata in enumerate(downloads)
+        }
+        for future in as_completed(future_map):
+            filename = future_map[future] or "downloaded_file"
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                tqdm.write(f"Failed {filename}: {exc}")
 
 
 def main(share_url: str, output_dir: str = ".") -> None:
@@ -409,7 +356,8 @@ def main(share_url: str, output_dir: str = ".") -> None:
         share_url = sys.argv[1]
     if len(sys.argv) > 2:
         output_dir = sys.argv[2]
-    download_share(share_url, output_dir)
+
+    download_multiple([share_url], output_dir)
 
 
 if __name__ == "__main__":
