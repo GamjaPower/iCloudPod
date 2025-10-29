@@ -2,6 +2,13 @@
 
 pip install requests tqdm
 
+# copy inst.json to downloader.py directory
+# if inst.json not eists, exit with error
+if [ ! -f inst.json ]; then
+    echo "inst.json not found!"
+    echo "Please make sure inst.json is in the same directory as inst.sh"
+    exit 1
+
 python downloader.py  
 
 cat downloads/inst.tar.gz.part* > downloads/inst.tar.gz
@@ -16,22 +23,12 @@ tar -zxvf v0.3.65.tar.gz -C /home
 mv -f /home/ComfyUI-0.3.65 /home/ComfyUI
 mv -f ComfyUI-Manager /home/ComfyUI/custom_nodes
 
-# mv -f models /home/ComfyUI
-
 SOURCE_DIR="models"
 TARGET_DIR="/home/ComfyUI/models"
-
-mkdir -p "$TARGET_DIR"
 
 find "$SOURCE_DIR" -type f -print0 | while IFS= read -r -d '' path; do
   base="${path#"$SOURCE_DIR/"}" 
   dest="$TARGET_DIR/$base"
-
-  if [[ -e "$dest" ]]; then
-    stamp=$(date +"%Y%m%d_%H%M%S")
-    dest="$TARGET_DIR/${base%.*}_$stamp.${base##*.}"
-  fi
-
   mv "$path" "$dest"
 done
 
