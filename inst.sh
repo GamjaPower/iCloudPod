@@ -39,8 +39,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-
 cd /home/ComfyUI/
-# source .venv/bin/activate
 python main.py --listen 0.0.0.0
 
