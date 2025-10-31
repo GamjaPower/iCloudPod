@@ -8,6 +8,7 @@ if [ ! -f inst.json ]; then
     echo "inst.json not found!"
     echo "Please make sure inst.json is in the same directory as inst.sh"
     exit 1
+fi
 
 python downloader.py  
 
